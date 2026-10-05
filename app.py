@@ -262,12 +262,17 @@ def bump_workspace_rev(db):
     )
 
 
-def stale_details(db, ws_rev, rel_seq):
-    """乐观并发明细：提交的号与当前不一致时返回 {字段: {expected, actual}}。"""
-    details = {}
+def stale_workspace_details(db, ws_rev):
+    """乐观并发明细：提交的工作区修订号与当前不一致时返回 {workspaceRev:{expected,actual}}。"""
     cur_rev = workspace_rev(db)
     if ws_rev != cur_rev:
-        details["workspaceRev"] = {"expected": ws_rev, "actual": cur_rev}
+        return {"workspaceRev": {"expected": ws_rev, "actual": cur_rev}}
+    return {}
+
+
+def stale_details(db, ws_rev, rel_seq):
+    """乐观并发明细：提交的号与当前不一致时返回 {字段: {expected, actual}}。"""
+    details = stale_workspace_details(db, ws_rev)
     cur_seq = current_release_seq(db)
     if rel_seq != cur_seq:
         details["releaseSeq"] = {"expected": rel_seq, "actual": cur_seq}
@@ -536,13 +541,35 @@ def put_state():
     state = request.get_json(force=True, silent=True)
     if not isinstance(state, dict):
         return jsonify({"ok": False, "error": "请求体必须是对象"}), 400
+    # 可选乐观并发：携带 X-Expected-Workspace-Rev 时，修订号不符直接拒绝，
+    # 不写库、不递增修订号（页面用它防止航线自动保存覆盖他页已核准的禁飞区）
+    expected_raw = request.headers.get("X-Expected-Workspace-Rev")
+    expected_rev = None
+    if expected_raw is not None:
+        try:
+            expected_rev = int(expected_raw)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "reason": "missing_fields",
+                            "error": "X-Expected-Workspace-Rev 必须是整数"}), 400
     db = get_db()
-    db.execute(
-        "INSERT INTO kv(k,v) VALUES('state',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (json.dumps(state, ensure_ascii=False),),
-    )
-    bump_workspace_rev(db)
-    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if expected_rev is not None:
+            details = stale_workspace_details(db, expected_rev)
+            if details:
+                db.rollback()
+                return jsonify({"ok": False, "reason": "stale",
+                                "error": "工作区已在他处变更，请刷新后重试",
+                                "details": details}), 409
+        db.execute(
+            "INSERT INTO kv(k,v) VALUES('state',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (json.dumps(state, ensure_ascii=False),),
+        )
+        bump_workspace_rev(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return jsonify({"ok": True, "rev": workspace_rev(db)})
 
 
