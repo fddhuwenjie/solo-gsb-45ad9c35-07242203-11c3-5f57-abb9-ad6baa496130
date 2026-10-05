@@ -17,6 +17,10 @@ let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
 let savedNfzs = [];        // 工作区已落库的禁飞区（已有发布时，页面的禁飞区编辑只存草稿）
+let saveDirty = false;     // 有未落库的工作区修改（航线，或未发布时的禁飞区）
+let saveInFlight = null;   // 进行中的自动保存请求
+let submitInFlight = false;// 核准/发布提交进行中（自动保存顺延，避免修订号竞争）
+let saveBlocked = false;   // 侦测到他页修改：暂停自动保存，待用户重新载入
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -80,18 +84,85 @@ async function loadState() {
   state.nfzs ||= [];
   savedNfzs = clone(state.nfzs);
 }
+// ----------------------------------------------------------- 自动保存协调
+// 航线编辑自动保存（防抖 500ms）。已有发布时仅落库航线：禁飞区草稿经核准
+// 后才生效，已核准内容以服务端为准，不用本页缓存覆盖；保存携带读取时的
+// 修订号，他页改过工作区即被拒绝并提示，不静默掩盖跨页面修订变化。
+function scheduleSave() {
+  if (saveBlocked) return; // 已侦测到他页修改：暂停自动保存，待用户重新载入
+  saveDirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveTimer = null; runSave(); }, 500);
+}
+async function runSave() {
+  if (saveBlocked) return false;
+  if (submitInFlight) { // 核准/发布提交进行中：保存顺延到其完成后，避免修订号竞争
+    if (saveDirty) scheduleSave();
+    return true;
+  }
+  if (saveInFlight) { // 不与在途保存并发（避免两个请求互相误判修订号）
+    if (saveDirty) scheduleSave(); // 在途保存未含最新修改：完成后再存一轮
+    return saveInFlight;
+  }
+  if (!saveDirty) return true;
+  const p = doSave();
+  saveInFlight = p;
+  try { return await p; } finally { if (saveInFlight === p) saveInFlight = null; }
+}
+async function doSave() {
+  if (currentRelease) {
+    // 已有发布：仅落库航线；禁飞区（草稿与已核准内容）都不随航线保存写入
+    saveDirty = false; // 已捕获当前修改；保存期间的再次编辑会重新置位
+    let r;
+    try {
+      r = await api("/api/state/route", {
+        method: "PUT",
+        body: JSON.stringify({ route: state.route, baseRev: workspaceRev }),
+      });
+    } catch (e) { toast("航线保存失败：" + e); return false; }
+    if (r && r.ok) { workspaceRev = r.rev; return true; }
+    if (r && r.reason === "stale") { onWorkspaceStale(r.details); return false; }
+    toast("航线保存失败：" + ((r && r.error) || "未知原因"));
+    return false;
+  }
+  // 未发布：整份工作区自动保存（含禁飞区）
+  saveDirty = false;
+  let r;
+  try {
+    r = await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
+  } catch (e) { toast("工作区保存失败：" + e); return false; }
+  if (r && typeof r.rev === "number") workspaceRev = r.rev;
+  savedNfzs = clone(state.nfzs); // 未发布：整体落库，镜像同步
+  return true;
+}
+// 调用方保证有未落库修改（如载入版本），立即保存
 async function saveStateNow() {
   clearTimeout(saveTimer);
-  // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
-  // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容
-  const payload = currentRelease ? { route: state.route, nfzs: savedNfzs } : state;
-  const r = await api("/api/state", { method: "PUT", body: JSON.stringify(payload) });
-  if (r && typeof r.rev === "number") workspaceRev = r.rev;
-  if (!currentRelease) savedNfzs = clone(state.nfzs); // 未发布：整体落库，镜像同步
+  saveTimer = null;
+  saveDirty = true;
+  return runSave();
 }
-function scheduleSave() {
+// 核准/发布提交前：让挂起的定时保存与进行中的保存请求先完成，
+// 提交携带其产生的最新修订号；提交本身不保存工作区
+async function settleRouteSaves() {
+  let ok = true;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    ok = !!(await runSave());
+  }
+  if (saveInFlight) {
+    try { ok = !!(await saveInFlight) && ok; } catch (e) { ok = false; }
+  }
+  return ok && !saveBlocked;
+}
+// 他页改写了工作区：暂停自动保存并提示重新载入（不静默采用新修订号）
+function onWorkspaceStale(details) {
+  saveBlocked = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveStateNow, 500);
+  saveTimer = null;
+  renderSaveNotice(details);
+  toast("工作区已被其他页面修改，自动保存已暂停");
 }
 function scheduleAnalyze() {
   clearTimeout(analyzeTimer);
@@ -591,12 +662,13 @@ function renderRelease(err) {
 }
 
 async function publishVersion(v) {
-  try {
-    await saveStateNow(); // 先落库，保证发布用的是最新工作区禁飞区与修订号
-  } catch (e) {
-    toast("工作区保存失败，无法发布");
+  if (submitInFlight) return;
+  // 先让挂起的航线保存完成，保证发布携带最新工作区修订号
+  if (!(await settleRouteSaves())) {
+    toast(saveBlocked ? "工作区已被其他页面修改，请先重新载入" : "工作区保存失败，无法发布");
     return;
   }
+  submitInFlight = true;
   let r;
   try {
     r = await api("/api/release", {
@@ -610,6 +682,8 @@ async function publishVersion(v) {
   } catch (e) {
     toast("发布请求失败：" + e);
     return;
+  } finally {
+    submitInFlight = false;
   }
   if (r.ok) {
     currentRelease = r.release;
@@ -617,19 +691,62 @@ async function publishVersion(v) {
     renderNfzDraft(); // 进入“已有发布”状态：此后的禁飞区变更先存草稿
     toast(`已发布 #${r.release.seq}（来源：${r.release.sourceVersionName}）`);
   } else {
-    if (r.reason === "stale") {
-      // 已发布号/工作区已变化：先同步最新状态，再展示失败原因
-      try {
-        const cur = await api("/api/release");
-        if (cur && cur.ok) {
-          currentRelease = cur.release;
-          if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
-        }
-      } catch (e) { /* 忽略 */ }
-    }
+    if (r.reason === "stale") await noteCrossPageChange(r);
     renderRelease(r);
     toast("发布失败：" + (r.error || "未知原因"));
   }
+}
+
+// 核准/发布被他页变更打断：工作区变化不静默采用新号（标记并提示重新载入）；
+// 仅发布号变化时同步最新发布信息。草稿保留，可处理后再提交。
+async function noteCrossPageChange(err) {
+  const d = (err && err.details) || {};
+  if (d.workspaceRev) {
+    saveBlocked = true;
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    renderSaveNotice(d);
+  }
+  if (d.releaseSeq) {
+    try {
+      const cur = await api("/api/release");
+      if (cur && cur.ok) currentRelease = cur.release;
+    } catch (e) { /* 忽略 */ }
+    renderRelease();
+  }
+}
+
+// ----------------------------------------------------------- 跨页面变更提示
+function renderSaveNotice(details) {
+  const box = $("#saveNotice");
+  if (!box) return;
+  if (!saveBlocked) { box.innerHTML = ""; return; }
+  const d = (details && details.workspaceRev) || null;
+  box.innerHTML = `<div class="stale-card">
+    <div class="draft-head">⚠ 工作区已被其他页面修改${d ? `（修订 ${d.expected} → ${d.actual}）` : ""}</div>
+    <div class="summary">为避免用本页缓存覆盖他页内容，本页自动保存与核准/发布提交已暂停。
+      重新载入以同步最新工作区与发布信息：未核准的禁飞区草稿会保留，未落库的航线修改将被还原。</div>
+    <div class="draft-actions"><button id="btnResync">重新载入工作区</button></div>
+  </div>`;
+  $("#btnResync").onclick = resyncWorkspace;
+}
+
+async function resyncWorkspace() {
+  // 保留未核准的禁飞区草稿，其余以服务端为准
+  const draft = currentRelease && nfzDraftDirty() ? clone(state.nfzs) : null;
+  try {
+    await loadState();
+    await loadRelease();
+  } catch (e) { toast("重新载入失败：" + e); return; }
+  if (draft && currentRelease) state.nfzs = draft;
+  saveBlocked = false;
+  saveDirty = false;
+  selection = { type: null, id: null };
+  renderSaveNotice(null);
+  renderPanel();
+  fitView();
+  runAnalyze();
+  toast("已重新载入工作区");
 }
 
 // ----------------------------------------------------------- 禁飞区草稿核准
@@ -684,12 +801,14 @@ function renderNfzDraft(err) {
 }
 
 async function submitNfzApproval() {
-  try {
-    await saveStateNow(); // 先落库航线编辑，保证提交的是所见修订号
-  } catch (e) {
-    toast("工作区保存失败，无法提交核准");
+  if (!currentRelease || submitInFlight) return;
+  // 提交核准不预先保存工作区；仅协调相邻的航线自动保存——挂起的定时
+  // 保存与进行中的请求先完成，核准携带其产生的最新修订号与所见发布号
+  if (!(await settleRouteSaves())) {
+    toast(saveBlocked ? "工作区已被其他页面修改，请先重新载入" : "航线保存失败，无法提交核准");
     return;
   }
+  submitInFlight = true;
   let r;
   try {
     r = await api("/api/nfz-approval", {
@@ -697,33 +816,25 @@ async function submitNfzApproval() {
       body: JSON.stringify({
         nfzs: state.nfzs,
         workspaceRev,
-        releaseSeq: currentRelease ? currentRelease.seq : 0,
+        releaseSeq: currentRelease.seq,
       }),
     });
   } catch (e) {
     toast("核准请求失败：" + e);
     return;
+  } finally {
+    submitInFlight = false;
   }
   if (r.ok) {
     workspaceRev = r.rev;
     savedNfzs = clone(state.nfzs); // 草稿已成为工作区禁飞区
     renderNfzDraft();
     toast(`禁飞区变更已核准（工作区修订 ${r.rev}）`);
-  } else {
-    if (r.reason === "stale") {
-      // 已发布号/工作区已变化：先同步最新状态，再展示失败原因
-      try {
-        const cur = await api("/api/release");
-        if (cur && cur.ok) {
-          currentRelease = cur.release;
-          if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
-        }
-      } catch (e) { /* 忽略 */ }
-      renderRelease();
-    }
-    renderNfzDraft(r); // 草稿保留，可继续修改后重新提交
-    toast("核准未通过：" + (r.error || "未知原因"));
+    return;
   }
+  if (r.reason === "stale") await noteCrossPageChange(r);
+  renderNfzDraft(r); // 草稿保留，可继续修改后重新提交
+  toast("核准未通过：" + (r.error || "未知原因"));
 }
 
 function discardNfzDraft() {
@@ -748,6 +859,7 @@ async function loadVersions() {
     item.querySelector(".vtime").textContent = v.createdAt;
     item.querySelector('[data-act="pub"]').onclick = () => publishVersion(v);
     item.querySelector('[data-act="load"]').onclick = async () => {
+      if (saveBlocked) { toast("工作区已被其他页面修改，请先重新载入"); return; }
       if (!confirm(`载入版本「${v.name}」？当前未另存的内容将被覆盖。`)) return;
       const full = await api(`/api/versions/${v.id}`);
       Object.assign(state, full.state);

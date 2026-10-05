@@ -546,6 +546,53 @@ def put_state():
     return jsonify({"ok": True, "rev": workspace_rev(db)})
 
 
+@app.put("/api/state/route")
+def put_state_route():
+    """仅保存工作区航线（禁飞区保持服务端现状），乐观并发校验。
+
+    已有发布时页面只自动保存航线：禁飞区草稿经 /api/nfz-approval 核准后才
+    落库，已核准的禁飞区也不能被航线保存用本页缓存覆盖。baseRev 为页面
+    读取时的工作区修订号，与当前不一致即拒绝并附明细，避免静默掩盖其他
+    页面的修改。
+    """
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "请求体必须是对象"}), 400
+    route = body.get("route")
+    try:
+        base_rev = int(body.get("baseRev"))
+    except (TypeError, ValueError):
+        base_rev = None
+    if not isinstance(route, dict) or base_rev is None:
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交航线对象 route 与整数 baseRev"}), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        cur_rev = workspace_rev(db)
+        if base_rev != cur_rev:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "工作区已被其他页面修改，请重新载入后再保存",
+                            "details": {"workspaceRev": {
+                                "expected": base_rev, "actual": cur_rev}}}), 409
+        row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(row["v"]) if row else {}
+        ws_state["route"] = route  # 仅替换航线，禁飞区以服务端为准
+        db.execute(
+            "INSERT INTO kv(k,v) VALUES('state',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (json.dumps(ws_state, ensure_ascii=False),),
+        )
+        bump_workspace_rev(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return jsonify({"ok": True, "rev": workspace_rev(db)})
+
+
 @app.post("/api/analyze")
 def api_analyze():
     state = request.get_json(force=True, silent=True)
